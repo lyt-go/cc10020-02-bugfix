@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -13,8 +14,13 @@ import zlib
 from datetime import datetime, timezone
 from typing import Any
 
-from app.persistence import json_store
+from app import persistence
 from app.services.base import BaseModuleService
+
+
+def _store():
+    """始终使用当前共享存储实例（测试会替换 ``persistence.json_store``）。"""
+    return persistence.json_store
 
 
 class DataLakeSinkService(BaseModuleService):
@@ -29,9 +35,20 @@ class DataLakeSinkService(BaseModuleService):
 
     def __init__(self) -> None:
         super().__init__()
-        self._lake_base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store", "lake")
+        self._lake_base_override: str | None = None
         os.makedirs(self._lake_base, exist_ok=True)
         self._write_stats: dict[str, int] = {}
+
+    @property
+    def _lake_base(self) -> str:
+        """数据湖根目录：跟随共享存储根目录，可用 ``_lake_base_override`` 重定向。"""
+        if self._lake_base_override:
+            return self._lake_base_override
+        return os.path.join(_store().base_dir, "lake")
+
+    @_lake_base.setter
+    def _lake_base(self, value: str) -> None:
+        self._lake_base_override = value
 
     def write_event(self, event_id: str, event_type: str, payload: dict[str, Any],
                     source_channel_id: int = 0) -> dict[str, Any]:
@@ -214,9 +231,154 @@ class DataLakeSinkService(BaseModuleService):
                 })
         return partitions
 
+    def list_event_partitions(self, event_types: list[str] | None = None) -> list[dict[str, Any]]:
+        """列出数据湖中的事件分区（供事件归档清理等模块跨模块消费）。
+
+        每个分区按 ``events/<事件类型>/<日期层级>`` 组织，返回文件清单元数据、
+        分区内容版本号 ``lake_version`` 以及事件类型/日期，归档模块据此按事件
+        类型限定归档范围，并以版本号识别同一落湖版本。
+        """
+        events_dir = os.path.join(self._lake_base, "events")
+        if not os.path.exists(events_dir):
+            return []
+
+        wanted = None
+        if event_types:
+            wanted = [str(item).strip() for item in event_types if str(item).strip()]
+
+        partitions: list[dict[str, Any]] = []
+        for root, dirs, files in os.walk(events_dir):
+            json_files = sorted(f for f in files if f.endswith(".json"))
+            if not json_files:
+                continue
+
+            rel_path = os.path.relpath(root, events_dir).replace(os.sep, "/")
+            rel_path = "" if rel_path == "." else rel_path
+            parts = rel_path.split("/") if rel_path else []
+            event_type = parts[0] if parts else ""
+            date_partition = "/".join(parts[1:]) if len(parts) > 1 else ""
+
+            if wanted is not None and not self._event_type_in_scope(event_type, wanted):
+                continue
+
+            file_metas: list[dict[str, Any]] = []
+            for name in json_files:
+                filepath = os.path.join(root, name)
+                try:
+                    stat = os.stat(filepath)
+                except OSError:
+                    continue
+                file_metas.append({
+                    "name": name,
+                    "path": filepath,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                })
+            if not file_metas:
+                continue
+
+            partition_key = f"events/{rel_path}" if rel_path else "events"
+            partitions.append({
+                "partition": partition_key,
+                "event_type": event_type,
+                "date": date_partition,
+                "path": root,
+                "files": file_metas,
+                "file_count": len(file_metas),
+                "size_bytes": sum(item["size"] for item in file_metas),
+                "latest_mtime": max(item["mtime"] for item in file_metas),
+                "lake_version": self.build_partition_version(
+                    {"partition": partition_key, "path": root},
+                    [item["name"] for item in file_metas],
+                ),
+            })
+
+        partitions.sort(key=lambda item: item["partition"])
+        return partitions
+
+    @staticmethod
+    def _event_type_in_scope(event_type: str, scope: list[str]) -> bool:
+        """判断事件类型是否落在策略范围，支持显式列表与 ``prefix*`` 通配。"""
+        for pattern in scope:
+            if pattern == event_type:
+                return True
+            if "*" in pattern and fnmatch.fnmatchcase(event_type, pattern):
+                return True
+        return False
+
+    def build_partition_version(self, partition: dict[str, Any], file_names: list[str] | None = None) -> str:
+        """计算落湖分区内容版本号。
+
+        版本号由分区路径和文件内容共同决定，相同版本代表同一份落湖数据，
+        归档模块可据此保证同一落湖版本只登记一份有效归档凭证。
+        """
+        base_path = str(partition.get("path", ""))
+        partition_key = str(partition.get("partition", ""))
+        names = sorted(file_names if file_names is not None else [])
+        if not names:
+            try:
+                names = sorted(f for f in os.listdir(base_path) if f.endswith(".json"))
+            except OSError:
+                names = []
+
+        digest = hashlib.sha256()
+        digest.update(partition_key.encode("utf-8"))
+        digest.update(b"\0")
+        for name in names:
+            digest.update(name.encode("utf-8"))
+            digest.update(b"\0")
+            try:
+                with open(os.path.join(base_path, name), "rb") as fh:
+                    digest.update(fh.read())
+            except OSError:
+                continue
+            digest.update(b"\0")
+        return "lv_" + digest.hexdigest()[:16]
+
+    def read_partition_files(
+        self,
+        partition: dict[str, Any],
+        file_names: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """读取事件分区内的落湖记录，供归档等跨模块流程消费。"""
+        base_path = str(partition.get("path", ""))
+        names = sorted(file_names if file_names is not None else [])
+        if not names:
+            try:
+                names = sorted(f for f in os.listdir(base_path) if f.endswith(".json"))
+            except OSError:
+                names = []
+
+        files: list[dict[str, Any]] = []
+        for name in names:
+            filepath = os.path.join(base_path, name)
+            try:
+                stat = os.stat(filepath)
+                with open(filepath, "rb") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            files.append({
+                "name": name,
+                "path": filepath,
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+                "content": content,
+            })
+
+        partition_key = str(partition.get("partition", ""))
+        return {
+            "ok": True,
+            "partition": partition_key,
+            "event_type": partition.get("event_type", ""),
+            "date": partition.get("date", ""),
+            "lake_version": self.build_partition_version(partition, [item["name"] for item in files]),
+            "files": files,
+        }
+
     def domain_snapshot(self) -> dict[str, Any]:
         """输出数据落湖的数据质量快照。"""
-        rows = json_store.get_all(self.MODULE)
+        rows = _store().get_all(self.MODULE)
         by_status = {status: 0 for status in self.STATUS_ORDER}
         for row in rows:
             s = row.get("status", "")

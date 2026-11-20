@@ -29,6 +29,11 @@ class JsonStore:
         self._lock = threading.Lock()
         self._caches: dict[str, dict[str, Any]] = {}
 
+    @property
+    def base_dir(self) -> str:
+        """存储根目录，供数据湖/归档等文件型分区与记录数据保持同一根路径。"""
+        return str(self._base_dir)
+
     def _file_path(self, key: str) -> Path:
         """获取分区对应的JSON文件路径。"""
         safe_key = key.replace("/", "_").replace("\\", "_")

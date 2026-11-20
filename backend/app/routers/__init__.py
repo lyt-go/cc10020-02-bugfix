@@ -3,4 +3,6 @@ from __future__ import annotations
 
 from app.routers import resource, pipeline
 
-ROUTERS = [resource, pipeline]
+# pipeline 含固定的 GET 路径，必须先于 resource 的 ``/api/{module}/{entry_id}``
+# 动态路径注册，否则 ``/api/pipeline/<action>`` 会被当作模块条目解析。
+ROUTERS = [pipeline, resource]

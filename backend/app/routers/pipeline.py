@@ -48,6 +48,11 @@ class ValidationRequest(BaseModel):
     source_module: str = ""
 
 
+class ArchiveRestoreRequest(BaseModel):
+    archive_file: str = ""
+    credential_no: str | None = None
+
+
 @router.post("/webhook-to-lake")
 def pipeline_webhook_to_lake(channel_id: int, payload: WebhookPayload) -> dict[str, Any]:
     """链路1: Webhook接收 → 事件解析 → 去重 → 分发路由 → 数据落湖。
@@ -168,7 +173,54 @@ def pipeline_dedup_stats() -> dict[str, Any]:
 
 @router.post("/archive-execute")
 def pipeline_archive_execute(policy_id: int) -> dict[str, Any]:
-    """链路10: 归档策略执行 → 压缩 → 过期清理。"""
+    """链路10: 归档策略执行 → 压缩 → 登记归档清单 → 同步清理台账 → 过期清理。
+
+    归档过程按事件类型从落湖事件分区读取数据，专用策略只覆盖配置范围内的分区。
+    """
     from app.services.event_archive import EventArchiveService
     svc = EventArchiveService()
     return svc.execute_archive(policy_id=policy_id)
+
+
+@router.get("/archive-manifest")
+def pipeline_archive_manifest(
+    event_type: str | None = None,
+    policy_id: int | None = None,
+    active_only: bool = False,
+) -> dict[str, Any]:
+    """链路10-1: 事件归档清单查询（每份有效归档凭证一条）。"""
+    from app.services.event_archive import EventArchiveService
+    svc = EventArchiveService()
+    items = svc.get_archive_manifest(
+        event_type=event_type, policy_id=policy_id, active_only=active_only)
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+@router.get("/archive-ledger")
+def pipeline_archive_ledger(
+    credential_no: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """链路10-2: 清理台账查询（源分区版本与保留日期取自归档清单）。"""
+    from app.services.event_archive import EventArchiveService
+    svc = EventArchiveService()
+    items = svc.get_cleanup_ledger(credential_no=credential_no, status=status)
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+@router.post("/archive-cleanup")
+def pipeline_archive_cleanup(retention_days: int | None = None) -> dict[str, Any]:
+    """链路10-3: 到期清理，按每条有效凭证自己的保留期执行。"""
+    from app.services.event_archive import EventArchiveService
+    svc = EventArchiveService()
+    result = svc.cleanup_expired_archives(retention_days=retention_days)
+    return {"ok": True, **result}
+
+
+@router.post("/archive-restore")
+def pipeline_archive_restore(request: ArchiveRestoreRequest) -> dict[str, Any]:
+    """链路10-4: 按有效凭证恢复，并核对来源分区与落湖版本。"""
+    from app.services.event_archive import EventArchiveService
+    svc = EventArchiveService()
+    return svc.restore_from_archive(
+        archive_file=request.archive_file, credential_no=request.credential_no)
